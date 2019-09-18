@@ -1,7 +1,11 @@
 package mapreduce
 
 import (
+	"encoding/json"
 	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"os"
 )
 
 func doMap(
@@ -53,6 +57,61 @@ func doMap(
 	//
 	// Your code here (Part I).
 	//
+
+	inputFile, err := os.Open(inFile)
+	if err != nil {
+		log.Panicf("open file:%s cause error:%s\n", inFile, err.Error())
+		return
+	}
+	defer func() {
+		if err := inputFile.Close(); err != nil {
+			log.Panicf("close file:%s cause error:%s\n", inFile, err.Error())
+		}
+	}()
+
+	inputContent, err := ioutil.ReadAll(inputFile)
+	if err != nil  {
+		log.Panicf("read file:%s cause error:%s\n", inFile, err.Error())
+		return
+	}
+
+	fileIndies := make(map[string][]int)
+	kvList := mapF(inFile, string(inputContent))
+	for index, kvPair := range kvList {
+		r := ihash(kvPair.Key) % nReduce
+		reduceFileName := reduceName(jobName, mapTask, r)
+
+		if indexList, ok := fileIndies[reduceFileName]; ok {
+			fileIndies[reduceFileName] = append(indexList, index)
+		} else {
+			fileIndies[reduceFileName] = []int{index}
+		}
+	}
+
+	for fileName, indies := range fileIndies {
+		func() {
+			outFile, err := os.OpenFile(fileName, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+			if err != nil {
+				log.Panicf("open file:%s cause error:%s\n", fileName, err.Error())
+				return
+			}
+			func() {
+				defer func() {
+					if err := outFile.Close(); err != nil {
+						log.Panicf("close file:%s cause error:%s\n",fileName, err.Error())
+					}
+				}()
+
+				enc := json.NewEncoder(outFile)
+				for _, index := range indies {
+					kvPair := kvList[index]
+					if err := enc.Encode(KeyValue{kvPair.Key, kvPair.Value}); err != nil {
+						log.Panicf("encode error:%s\n", err.Error())
+					}
+				}
+			}()
+		}()
+	}
 }
 
 func ihash(s string) int {
