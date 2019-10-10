@@ -2,8 +2,14 @@ package main
 
 import (
 	"fmt"
+	"log"
+
+	//"log"
 	"mapreduce"
 	"os"
+	"strconv"
+	"strings"
+	"unicode"
 )
 
 //
@@ -15,6 +21,33 @@ import (
 //
 func mapF(filename string, contents string) []mapreduce.KeyValue {
 	// Your code here (Part II).
+	wordCount := make(map[string]int)
+
+	updateWordCount := func(word string) {
+		if len(word) == 0 {
+			return
+		}
+
+		if count, ok := wordCount[word]; ok {
+			wordCount[word] = count+1
+		} else {
+			wordCount[word] = 1
+		}
+	}
+
+	words := strings.FieldsFunc(contents, func(r rune) bool {
+		return !unicode.IsLetter(r)
+	})
+	for _, word := range words {
+		updateWordCount(word)
+	}
+
+	result := make([]mapreduce.KeyValue, 0, len(wordCount))
+	for word, count := range wordCount {
+		result = append(result, mapreduce.KeyValue{Key:word, Value:strconv.Itoa(count)})
+	}
+
+	return result
 }
 
 //
@@ -24,6 +57,20 @@ func mapF(filename string, contents string) []mapreduce.KeyValue {
 //
 func reduceF(key string, values []string) string {
 	// Your code here (Part II).
+	totalCount := 0
+
+	for _, value := range values {
+		if len(value) == 0 {
+			continue
+		}
+		if count, err := strconv.Atoi(value); err != nil {
+			log.Panicf("atoi error:%s", err.Error())
+		} else {
+			totalCount += count
+		}
+	}
+
+	return strconv.Itoa(totalCount)
 }
 
 // Can be run in 3 ways:
