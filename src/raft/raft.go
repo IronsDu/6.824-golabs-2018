@@ -61,7 +61,11 @@ const (
 )
 
 const (
-	DefaultElectionTimeoutSeconds = 10
+	DefaultElectionTimeoutMilliSeconds = 500
+)
+
+const (
+	InvalidPeerNodeIndex = -1
 )
 
 //
@@ -105,13 +109,11 @@ func (rf *Raft) GetState() (int, bool) {
 	defer rf.mu.Unlock()
 
 	term = rf.currentTerm
+	isleader = rf.raftState == PeerRaftStateLeader
 
-	if rf.raftState == PeerRaftStateLeader {
-		isleader = rf.leaderIndex == rf.me
-	} else {
-		isleader = false
+	if isleader {
+		DPrintf("[%d] is leader", rf.me)
 	}
-
 	return term, isleader
 }
 
@@ -164,10 +166,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	term int
-	candidateId int
-	lastLogIndex int
-	lastLogTerm int
+	Term int
+	CandidateId int
+	LastLogIndex int
+	LastLogTerm int
 }
 
 //
@@ -176,8 +178,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	term int
-	voteGranted bool
+	Term int
+	VoteGranted bool
 }
 
 //
@@ -188,25 +190,38 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if args.term < rf.currentTerm {
-		reply.term = rf.currentTerm
-		reply.voteGranted = false
+	oldTerm := rf.currentTerm
+
+	defer func() {
+		DPrintf("[%d] recv vote request from %d, term:%d, self old term:%d, self end term:%d, self votedFor:%d, result:%t",
+			rf.me, args.CandidateId, args.Term, oldTerm, rf.currentTerm, rf.votedFor, reply.VoteGranted)
+	}()
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	} else if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.switchFollower()
+		reply.VoteGranted = true
 		return
 	}
 
-	if rf.votedFor != -1 {
-		reply.voteGranted = false
+	if rf.votedFor != InvalidPeerNodeIndex {
+		reply.VoteGranted = false
 		return
 	}
 
-	if args.lastLogTerm < rf.lastLogTerm ||
-		(args.lastLogTerm == rf.lastLogTerm && args.lastLogIndex < rf.lastLogIndex){
-		reply.voteGranted = false
+	if args.LastLogTerm < rf.lastLogTerm ||
+		(args.LastLogTerm == rf.lastLogTerm && args.LastLogIndex < rf.lastLogIndex){
+		reply.VoteGranted = false
 		return
 	}
 
-	rf.votedFor = args.candidateId
-	reply.voteGranted = true
+	rf.currentTerm = args.Term
+	rf.switchFollower()
+	reply.VoteGranted = true
 }
 
 //
@@ -280,16 +295,16 @@ func (rf *Raft) Kill() {
 }
 
 func (rf *Raft) switchToLeader() {
-	if rf.raftState == PeerRaftStateLeader {
-		return
-	}
+	rf.leaderIndex = rf.me
 	rf.raftState = PeerRaftStateLeader
 	rf.stopElectionTimer()
+
+	DPrintf("[%d] switch to leader", rf.me)
 }
 
-func (rf *Raft) switchFollower(term int) {
-	rf.currentTerm = term
+func (rf *Raft) switchFollower() {
 	rf.raftState = PeerRaftStateFollower
+	rf.votedFor = InvalidPeerNodeIndex
 	rf.resetElectionTimer()
 }
 
@@ -298,6 +313,9 @@ func (rf* Raft) switchToCandidate() {
 	rf.votedFor = rf.me
 	rf.voted = rf.voted[:0]
 	rf.raftState = PeerRaftStateCandidate
+	rf.leaderIndex = InvalidPeerNodeIndex
+
+	DPrintf("[%d[ switch to candidate, term:%d", rf.me, rf.currentTerm)
 }
 
 func (rf *Raft) stopElectionTimer() {
@@ -315,11 +333,12 @@ func (rf *Raft) resetElectionTimer() {
 }
 
 func (rf *Raft) startElectionTimer(electionCh <- chan interface{}) {
-	timeoutSecond := DefaultElectionTimeoutSeconds+rand.Intn(DefaultElectionTimeoutSeconds)
-	ticker := time.NewTimer(time.Second * time.Duration(timeoutSecond))
+	timeoutSecond := DefaultElectionTimeoutMilliSeconds+rand.Intn(DefaultElectionTimeoutMilliSeconds)
+	ticker := time.NewTimer(time.Millisecond * time.Duration(timeoutSecond))
 
 	select {
 	case <- electionCh:
+		DPrintf("[%d] recv notify stop election", rf.me)
 		break
 	case <- ticker.C:
 		rf.election()
@@ -348,28 +367,37 @@ func (rf *Raft) handleVoteReply(serverIndex int, reply RequestVoteReply) {
 	defer rf.mu.Unlock()
 
 	if rf.raftState != PeerRaftStateCandidate {
+		DPrintf("[%d] recv vote reply from %d, but self state not candidate", rf.me, serverIndex)
 		return
 	}
 
-	if reply.voteGranted {
+	if reply.VoteGranted {
 		for _, i := range rf.voted {
 			if i == serverIndex {
 				return
 			}
 		}
+		DPrintf("[%d] recv vote granted from %d", rf.me, serverIndex)
 		rf.voted = append(rf.voted, serverIndex)
 		if len(rf.voted) >= (len(rf.peers)/2+1){
 			rf.switchToLeader()
 		}
-	} else if reply.term > rf.currentTerm {
-		rf.switchFollower(reply.term)
+	} else if reply.Term > rf.currentTerm {
+		DPrintf("[%d] recv vote reject from %d", rf.me, serverIndex)
+		rf.currentTerm = reply.Term
+		rf.switchFollower()
+	} else {
+		DPrintf("[%d] recv other vote reply from %d, reply term:%d, self term:%d, granted:%t",
+			rf.me, serverIndex, reply.Term, rf.currentTerm, reply.VoteGranted)
 	}
 }
 
 func (rf *Raft) election() {
+	DPrintf("[%d] start election", rf.me)
+
 	var peerLen int
 	voteRequest := RequestVoteArgs{
-		candidateId:rf.me}
+		CandidateId:rf.me}
 
 	r := func() bool {
 		rf.mu.Lock()
@@ -380,8 +408,8 @@ func (rf *Raft) election() {
 		}
 		rf.switchToCandidate()
 		peerLen = len(rf.peers)
-		voteRequest.term = rf.currentTerm
-		voteRequest.lastLogTerm, voteRequest.lastLogIndex = rf.getLastLogTermAndIndex()
+		voteRequest.Term = rf.currentTerm
+		voteRequest.LastLogTerm, voteRequest.LastLogIndex = rf.getLastLogTermAndIndex()
 
 		return true
 	}()
@@ -428,8 +456,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastLogIndex = -1
 	rf.lastLogTerm = -1
 	rf.lastApplied = -1
+	rf.leaderIndex = InvalidPeerNodeIndex
+	rf.currentTerm = 0
 
-	rf.switchFollower(-1)
+	rf.switchFollower()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
