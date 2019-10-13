@@ -193,35 +193,29 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	oldTerm := rf.currentTerm
 
 	defer func() {
-		DPrintf("[%d] recv vote request from %d, term:%d, self old term:%d, self end term:%d, self votedFor:%d, result:%t",
-			rf.me, args.CandidateId, args.Term, oldTerm, rf.currentTerm, rf.votedFor, reply.VoteGranted)
+		DPrintf("[%d] recv vote request from %d, term:%d, self old term:%d, " +
+			"self end term:%d, self votedFor:%d, result:%t",
+			rf.me, args.CandidateId, args.Term, oldTerm,
+			rf.currentTerm, rf.votedFor, reply.VoteGranted)
 	}()
 
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
-		return
 	} else if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.switchFollower()
 		reply.VoteGranted = true
-		return
-	}
-
-	if rf.votedFor != InvalidPeerNodeIndex {
+	} else if rf.votedFor != InvalidPeerNodeIndex {
 		reply.VoteGranted = false
-		return
-	}
-
-	if args.LastLogTerm < rf.lastLogTerm ||
-		(args.LastLogTerm == rf.lastLogTerm && args.LastLogIndex < rf.lastLogIndex){
+	} else if args.LastLogTerm < rf.lastLogTerm ||
+		(args.LastLogTerm == rf.lastLogTerm && args.LastLogIndex < rf.lastLogIndex) {
 		reply.VoteGranted = false
-		return
+	} else {
+		rf.currentTerm = args.Term
+		rf.switchFollower()
+		reply.VoteGranted = true
 	}
-
-	rf.currentTerm = args.Term
-	rf.switchFollower()
-	reply.VoteGranted = true
 }
 
 //
@@ -304,7 +298,6 @@ func (rf *Raft) switchToLeader() {
 
 func (rf *Raft) switchFollower() {
 	rf.raftState = PeerRaftStateFollower
-	rf.votedFor = InvalidPeerNodeIndex
 	rf.resetElectionTimer()
 }
 
@@ -312,10 +305,11 @@ func (rf* Raft) switchToCandidate() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.voted = rf.voted[:0]
+	rf.voted = append(rf.voted, rf.me)
 	rf.raftState = PeerRaftStateCandidate
 	rf.leaderIndex = InvalidPeerNodeIndex
 
-	DPrintf("[%d[ switch to candidate, term:%d", rf.me, rf.currentTerm)
+	DPrintf("[%d] switch to candidate, term:%d", rf.me, rf.currentTerm)
 }
 
 func (rf *Raft) stopElectionTimer() {
@@ -362,9 +356,13 @@ func (rf *Raft) isCandidate() bool {
 	return rf.raftState == PeerRaftStateCandidate
 }
 
-func (rf *Raft) handleVoteReply(serverIndex int, reply RequestVoteReply) {
+func (rf *Raft) handleVoteReply(serverIndex int, requestTerm int, reply RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	if requestTerm != rf.currentTerm {
+		return
+	}
 
 	if rf.raftState != PeerRaftStateCandidate {
 		DPrintf("[%d] recv vote reply from %d, but self state not candidate", rf.me, serverIndex)
@@ -379,7 +377,7 @@ func (rf *Raft) handleVoteReply(serverIndex int, reply RequestVoteReply) {
 		}
 		DPrintf("[%d] recv vote granted from %d", rf.me, serverIndex)
 		rf.voted = append(rf.voted, serverIndex)
-		if len(rf.voted) >= (len(rf.peers)/2+1){
+		if len(rf.voted) >= (len(rf.peers)/2+1) {
 			rf.switchToLeader()
 		}
 	} else if reply.Term > rf.currentTerm {
@@ -396,10 +394,10 @@ func (rf *Raft) election() {
 	DPrintf("[%d] start election", rf.me)
 
 	var peerLen int
-	voteRequest := RequestVoteArgs{
+	voteRequest := &RequestVoteArgs{
 		CandidateId:rf.me}
 
-	r := func() bool {
+	preparedCheck := func() bool {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 
@@ -414,7 +412,7 @@ func (rf *Raft) election() {
 		return true
 	}()
 
-	if !r {
+	if !preparedCheck {
 		return
 	}
 
@@ -423,13 +421,13 @@ func (rf *Raft) election() {
 			continue
 		}
 
-		var reply RequestVoteReply
-		rf.sendRequestVote(peerIndex, &voteRequest, &reply)
-		rf.handleVoteReply(peerIndex, reply)
-
-		if !rf.isCandidate() {
-			break
-		}
+		go func(peerIndex int) {
+			var reply RequestVoteReply
+			DPrintf("start send request to [%d]", peerIndex)
+			rf.sendRequestVote(peerIndex, voteRequest, &reply)
+			DPrintf("recv reply from [%d]", peerIndex)
+			rf.handleVoteReply(peerIndex, voteRequest.Term, reply)
+		}(peerIndex)
 	}
 }
 
@@ -458,7 +456,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = -1
 	rf.leaderIndex = InvalidPeerNodeIndex
 	rf.currentTerm = 0
-
+	rf.votedFor = InvalidPeerNodeIndex
 	rf.switchFollower()
 
 	// initialize from state persisted before a crash
