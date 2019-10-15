@@ -55,16 +55,14 @@ type LogEntry struct {
 type PeerRaftState int
 
 const (
-	PeerRaftStateFollower PeerRaftState = iota
+	PeerRaftStateFollower PeerRaftState = iota+1
 	PeerRaftStateLeader
 	PeerRaftStateCandidate
 )
 
 const (
+	LeaderAppendLogTimeoutMilliSeconds = 200
 	DefaultElectionTimeoutMilliSeconds = 500
-)
-
-const (
 	InvalidPeerNodeIndex = -1
 )
 
@@ -93,6 +91,7 @@ type Raft struct {
 	raftState PeerRaftState
 
 	electionCh chan interface{}
+	appendLogCh chan interface{}
 
 	voted	[]int
 }
@@ -218,6 +217,29 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 }
 
+type AppendLogRequest struct {
+	Term int
+}
+
+type AppendLogReply struct {
+
+}
+
+func (rf *Raft) RequestAppendLog(args *AppendLogRequest, reply *AppendLogReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm {
+		return
+	} else if args.Term == rf.currentTerm && rf.raftState == PeerRaftStateLeader {
+		return
+	} else if args.Term > rf.currentTerm {
+
+	}
+
+	rf.resetElectionTimer()
+}
+
 //
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
@@ -252,6 +274,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) sendAppendLog(server int, args *AppendLogRequest, reply *AppendLogReply) bool {
+	ok := rf.peers[server].Call("Raft.RequestAppendLog", args, reply)
+	return ok
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -292,6 +318,7 @@ func (rf *Raft) switchToLeader() {
 	rf.leaderIndex = rf.me
 	rf.raftState = PeerRaftStateLeader
 	rf.stopElectionTimer()
+	rf.resetAppendLogRoutine()
 
 	DPrintf("[%d] switch to leader", rf.me)
 }
@@ -337,6 +364,58 @@ func (rf *Raft) startElectionTimer(electionCh <- chan interface{}) {
 	case <- ticker.C:
 		rf.election()
 		break
+	}
+}
+
+func (rf *Raft) stopAppendLogRoutine() {
+	if rf.appendLogCh != nil {
+		close(rf.appendLogCh)
+		rf.appendLogCh = nil
+	}
+}
+
+func (rf *Raft) resetAppendLogRoutine() {
+	rf.stopAppendLogRoutine()
+	rf.appendLogCh = make(chan interface{})
+
+	go rf.startAppendLogRoutine(rf.appendLogCh)
+}
+
+func (rf *Raft) startAppendLogRoutine(appendLogCh <- chan interface{}) {
+	for {
+		ticker := time.NewTimer(time.Millisecond * time.Duration(LeaderAppendLogTimeoutMilliSeconds))
+
+		select {
+		case <- appendLogCh:
+			DPrintf("[%d] recv notify stop election", rf.me)
+			return
+		case <- ticker.C:
+			break
+		}
+
+		go func() {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			if rf.raftState != PeerRaftStateLeader {
+				return
+			}
+			peerLen := len(rf.peers)
+			appendLogRequest := &AppendLogRequest{
+				Term:rf.currentTerm,
+			}
+
+			for peerIndex := 0; peerIndex < peerLen; peerIndex++ {
+				if peerIndex == rf.me {
+					continue
+				}
+
+				go func(peerIndex int) {
+					var reply AppendLogReply
+					rf.sendAppendLog(peerIndex, appendLogRequest, &reply)
+				}(peerIndex)
+			}
+		}()
 	}
 }
 
