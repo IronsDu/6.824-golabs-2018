@@ -62,7 +62,7 @@ const (
 
 const (
 	LeaderAppendLogTimeoutMilliSeconds = 200
-	DefaultElectionTimeoutMilliSeconds = 500
+	DefaultElectionTimeoutMilliSeconds = 100
 	InvalidPeerNodeIndex = -1
 )
 
@@ -318,7 +318,7 @@ func (rf *Raft) switchToLeader() {
 	rf.leaderIndex = rf.me
 	rf.raftState = PeerRaftStateLeader
 	rf.stopElectionTimer()
-	rf.resetAppendLogRoutine()
+	//rf.resetAppendLogRoutine()
 
 	DPrintf("[%d] switch to leader", rf.me)
 }
@@ -480,7 +480,8 @@ func (rf *Raft) election() {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 
-		if rf.raftState != PeerRaftStateFollower {
+		if rf.raftState == PeerRaftStateLeader {
+			DPrintf("[%d] state is:%d when election check", rf.me, int(rf.raftState))
 			return false
 		}
 		rf.switchToCandidate()
@@ -492,8 +493,18 @@ func (rf *Raft) election() {
 	}()
 
 	if !preparedCheck {
+		DPrintf("[%d] prepared check failed", rf.me)
 		return
 	}
+
+	func() {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if rf.raftState == PeerRaftStateLeader {
+			return
+		}
+		rf.resetElectionTimer()
+	}()
 
 	for peerIndex := 0; peerIndex < peerLen; peerIndex++ {
 		if peerIndex == rf.me {
@@ -502,9 +513,9 @@ func (rf *Raft) election() {
 
 		go func(peerIndex int) {
 			var reply RequestVoteReply
-			DPrintf("start send request to [%d]", peerIndex)
+			DPrintf("[%d] start send request to [%d], term:%d", rf.me, peerIndex, voteRequest.Term)
 			rf.sendRequestVote(peerIndex, voteRequest, &reply)
-			DPrintf("recv reply from [%d]", peerIndex)
+			DPrintf("[%d] recv reply from [%d], term:%d", rf.me, peerIndex, voteRequest.Term)
 			rf.handleVoteReply(peerIndex, voteRequest.Term, reply)
 		}(peerIndex)
 	}
