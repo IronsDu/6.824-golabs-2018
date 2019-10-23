@@ -241,7 +241,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.LastLogIndex < rf.lastLogIndex ||
 		(args.LastLogIndex == rf.lastLogIndex && args.LastLogTerm < rf.lastLogTerm) {
 		reply.VoteGranted = false
-		DPrintf("[%d] recv vote request, but log not update to date", rf.me)
+		DPrintf("[%d] recv vote request, but log not update to date," +
+			" args:%v, rf:%v", rf.me, args, rf)
 		return
 	}
 
@@ -465,7 +466,7 @@ func (rf *Raft) switchToLeader() {
 
 func (rf *Raft) switchFollower() {
 	rf.raftState = PeerRaftStateFollower
-	DPrintf("[%d] switch to follower, self:%p, seq:%d", rf.me, rf, rf.electionSeq)
+	DPrintf("[%d] switch to follower, self:%p, seq:%d, term:%d", rf.me, rf, rf.electionSeq, rf.currentTerm)
 	rf.resetElectionTimer()
 	rf.stopAppendLogRoutine()
 }
@@ -495,10 +496,10 @@ func (rf *Raft) resetElectionTimer() {
 	rf.electionSeq++
 	DPrintf("[%d] resetElectionTimer, self:%p, seq:%d", rf.me, rf, rf.electionSeq)
 	n := time.Now().UnixNano()
-	go rf.startElectionTimer(rf.electionCh, rf.electionSeq, n)
+	go rf.startElectionTimer(rf.electionCh, rf.electionSeq, rf.currentTerm, n)
 }
 
-func (rf *Raft) startElectionTimer(electionCh <- chan interface{}, electionSeq int, n int64) {
+func (rf *Raft) startElectionTimer(electionCh <- chan interface{}, electionSeq int, term int, n int64) {
 	timeoutSecond := DefaultElectionTimeoutMilliSeconds+rand.Intn(DefaultElectionTimeoutMilliSeconds/2)
 	ticker := time.NewTimer(time.Millisecond * time.Duration(timeoutSecond))
 	DPrintf("[%d] startElectionTimer, self:%p, seq:%d", rf.me, rf, electionSeq)
@@ -510,7 +511,7 @@ func (rf *Raft) startElectionTimer(electionCh <- chan interface{}, electionSeq i
 		DPrintf("[%d] recv kill", rf.me)
 		break
 	case <- ticker.C:
-		rf.election(electionSeq, n)
+		rf.election(electionSeq, term, n)
 		break
 	}
 }
@@ -523,6 +524,7 @@ func (rf *Raft) stopAppendLogRoutine() {
 }
 
 func (rf *Raft) resetAppendLogRoutine() {
+	DPrintf("[%d] resetAppendLogRoutine, term:%d", rf.me, rf.currentTerm)
 	rf.stopAppendLogRoutine()
 	rf.appendLogCh = make(chan interface{})
 
@@ -694,8 +696,6 @@ func (rf *Raft) handleAppendLogReply(peerIndex int, maxLogIndex int, maxLogTerm 
 		if commitIndex > rf.leaderCommit {
 			rf.leaderCommit = commitIndex
 			rf.applyLog()
-		} else {
-			DPrintf("fuck")
 		}
 	}
 }
@@ -735,10 +735,7 @@ func (rf *Raft) handleVoteReply(serverIndex int, requestTerm int, reply RequestV
 	}
 }
 
-func (rf *Raft) election(electionSeq int, n int64) {
-	now := time.Now().UnixNano()
-	DPrintf("[%d] start election, term:%d, self:%p, seq:%d, cost:%d ms, now:%d",
-		rf.me, rf.currentTerm, rf, electionSeq, (now-n)/1000/1000, now)
+func (rf *Raft) election(electionSeq int, term int, n int64) {
 
 	var peerLen int
 	voteRequest := &RequestVoteArgs{
@@ -748,10 +745,19 @@ func (rf *Raft) election(electionSeq int, n int64) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 
+		now := time.Now().UnixNano()
+		DPrintf("[%d] start election, term:%d, self:%p, seq:%d, cost:%d ms, now:%d",
+			rf.me, rf.currentTerm, rf, electionSeq, (now-n)/1000/1000, now)
+
 		if rf.raftState == PeerRaftStateLeader {
 			DPrintf("[%d] state is:%d when election check", rf.me, int(rf.raftState))
 			return false
 		}
+		if term != rf.currentTerm {
+			DPrintf("[%d] current term %d not be old term:%d", rf.me, rf.currentTerm, term)
+			return false
+		}
+
 		DPrintf("[%d] rf is %p", rf.me, rf)
 		rf.switchToCandidate()
 		peerLen = len(rf.peers)
@@ -762,7 +768,8 @@ func (rf *Raft) election(electionSeq int, n int64) {
 	}()
 
 	if !preparedCheck {
-		DPrintf("[%d] prepared check failed, term:%d, self:%p", rf.me, rf.currentTerm, rf)
+		// not atomic read rf.currentTerm for log
+		DPrintf("[%d] prepared check failed, self:%p", rf.me, rf)
 		return
 	}
 
