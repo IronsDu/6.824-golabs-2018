@@ -91,9 +91,6 @@ type Raft struct {
 
 	logs	[]LogEntry
 
-	lastLogTerm int
-	lastLogIndex int
-
 	leaderIndex int
 	raftState PeerRaftState
 
@@ -219,7 +216,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.currentTerm, rf.votedFor, reply.VoteGranted)
 	}(rf.currentTerm)
 
-	DPrintf("[%d] recv vote request from [%d]", rf.me, args.CandidateId)
+	lastLogTerm, lastLogIndex := rf.getLastLogTermAndIndex()
+	DPrintf("[%d] recv vote request from [%d], args:%v, rf:[%d, %d]",
+		rf.me, args.CandidateId, args, lastLogIndex, lastLogTerm)
 
 	// 来自低任期的投票
 	if args.Term < rf.currentTerm {
@@ -238,8 +237,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	// 检测此候选者的日志跟自己比较是否足够新
-	if args.LastLogIndex < rf.lastLogIndex ||
-		(args.LastLogIndex == rf.lastLogIndex && args.LastLogTerm < rf.lastLogTerm) {
+	if args.LastLogIndex < lastLogIndex ||
+		(args.LastLogIndex == lastLogIndex && args.LastLogTerm < lastLogTerm) {
 		reply.VoteGranted = false
 		DPrintf("[%d] recv vote request, but log not update to date," +
 			" args:%v, rf:%v", rf.me, args, rf)
@@ -282,6 +281,7 @@ func (rf *Raft) getFollowerState(id int) *FollowerState {
 }
 
 func (rf *Raft) initFollowerState() {
+	_, lastLogIndex := rf.getLastLogTermAndIndex()
 	rf.followerStates = make(map[int]*FollowerState)
 	for peerIndex := 0; peerIndex < len(rf.peers); peerIndex++ {
 		if peerIndex == rf.me {
@@ -289,7 +289,7 @@ func (rf *Raft) initFollowerState() {
 		}
 
 		rf.followerStates[peerIndex] = &FollowerState{
-			nextIndex:rf.lastLogIndex+1,
+			nextIndex:lastLogIndex+1,
 			matchIndex:-1,
 		}
 	}
@@ -308,7 +308,7 @@ func (rf *Raft) RequestAppendLog(args *AppendLogRequest, reply *AppendLogReply) 
 	reply.Success = false
 
 	if args.Term < rf.currentTerm {
-		DPrintf("[%d] handle RequestAppendLog from [%d] by small term, " +
+		DPrintf("[%d] error handle RequestAppendLog from [%d] by small term, " +
 			"self term:%d, request term:%d, self:%p, seq:%d",
 			rf.me, args.CandidateId, rf.currentTerm, args.Term, rf, rf.electionSeq)
 		reply.Term = rf.currentTerm
@@ -321,9 +321,10 @@ func (rf *Raft) RequestAppendLog(args *AppendLogRequest, reply *AppendLogReply) 
 		// 且验证之前日志的任期
 		if args.PrevLogIndex > lastLogIndex ||
 			args.PrevLogTerm < rf.logs[args.PrevLogIndex].Term {
-			DPrintf("[%d] recv invalid log, PrevLogIndex:%d, lastLogIndex:%d," +
+			DPrintf("[%d] error handle RequestAppendLog recv invalid log, PrevLogIndex:%d, lastLogIndex:%d," +
 				"PrevLogTerm:%d, self log:%v",
 				rf.me, args.PrevLogIndex, lastLogIndex, args.PrevLogTerm, rf.logs)
+			rf.switchFollower()
 			return
 		}
 	}
@@ -332,7 +333,7 @@ func (rf *Raft) RequestAppendLog(args *AppendLogRequest, reply *AppendLogReply) 
 		if entry.Index < len(rf.logs) {
 			oldLog := rf.logs[entry.Index]
 			if entry.Term < oldLog.Term {
-				DPrintf("[%d] recv error log, old log term:%d, log term:%d",
+				DPrintf("[%d] error handle RequestAppendLog recv error log, old log term:%d, log term:%d",
 					rf.me, oldLog.Term, entry.Term)
 				return
 			}
@@ -348,9 +349,9 @@ func (rf *Raft) RequestAppendLog(args *AppendLogRequest, reply *AppendLogReply) 
 
 	now := time.Now().UnixNano()
 	DPrintf("[%d] handle RequestAppendLog from [%d], " +
-		"self term:%d, request term:%d, self:%p, seq:%d, wait:%d ms, now:%d",
+		"self term:%d, request term:%d, self:%p, seq:%d, wait:%d ms, now:%d, current logs:%v",
 		rf.me, args.CandidateId, rf.currentTerm, args.Term,
-		rf, rf.electionSeq, (now-rf.lastAppendLogTime)/1000/1000, now)
+		rf, rf.electionSeq, (now-rf.lastAppendLogTime)/1000/1000, now, rf.logs)
 
 	rf.leaderIndex = args.CandidateId
 	if args.LeaderCommit >= rf.leaderCommit {
@@ -429,17 +430,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, false
 	}
 
-	rf.lastLogIndex++
-	index = rf.lastLogIndex
+	_, index = rf.getLastLogTermAndIndex()
+	index++
 	term = rf.currentTerm
-	rf.lastLogTerm = rf.currentTerm
 
 	rf.logs = append(rf.logs, LogEntry{
-		Index:   rf.lastLogIndex,
+		Index:   index,
 		Term:    term,
 		Command: command,
 	})
-
+	DPrintf("[%d] start %v, current logs:%v", rf.me, command, rf.logs)
 	return index, term, isLeader
 }
 
@@ -462,6 +462,10 @@ func (rf *Raft) switchToLeader() {
 	rf.initFollowerState()
 	rf.stopElectionTimer()
 	rf.resetAppendLogRoutine()
+	// 立即进行一次日志复制
+	go func() {
+		rf.replicatedLog()
+	}()
 }
 
 func (rf *Raft) switchFollower() {
@@ -485,6 +489,7 @@ func (rf* Raft) switchToCandidate() {
 
 func (rf *Raft) stopElectionTimer() {
 	if rf.electionCh != nil {
+		DPrintf("[%d] stop election timer, seq:%d", rf.me, rf.electionSeq)
 		close(rf.electionCh)
 		rf.electionCh = nil
 	}
@@ -502,18 +507,21 @@ func (rf *Raft) resetElectionTimer() {
 func (rf *Raft) startElectionTimer(electionCh <- chan interface{}, electionSeq int, term int, n int64) {
 	timeoutSecond := DefaultElectionTimeoutMilliSeconds+rand.Intn(DefaultElectionTimeoutMilliSeconds/2)
 	ticker := time.NewTimer(time.Millisecond * time.Duration(timeoutSecond))
-	DPrintf("[%d] startElectionTimer, self:%p, seq:%d", rf.me, rf, electionSeq)
+	DPrintf("[%d] startElectionTimer, self:%p, seq:%d, term:%d, n:%d", rf.me, rf, electionSeq, term, n)
 	select {
 	case <- electionCh:
 		DPrintf("[%d] recv notify stop election, seq:%d", rf.me, electionSeq)
 		break
 	case <- rf.shutdownCh:
-		DPrintf("[%d] recv kill", rf.me)
+		DPrintf("[%d] recv kill, seq:%d", rf.me, electionSeq)
 		break
 	case <- ticker.C:
+		DPrintf("[%d] recv ticker, seq:%d", rf.me, electionSeq)
 		rf.election(electionSeq, term, n)
 		break
 	}
+
+	DPrintf("[%d] startElectionTimer function ending, seq:%d, now:%d", rf.me, electionSeq, time.Now().UnixNano())
 }
 
 func (rf *Raft) stopAppendLogRoutine() {
@@ -688,13 +696,13 @@ func (rf *Raft) handleAppendLogReply(peerIndex int, maxLogIndex int, maxLogTerm 
 	}
 	sort.Ints(matchIndexArr)
 
-	commitIndex := matchIndexArr[len(rf.peers)/2]
-	DPrintf("[%d] commitIndex is:%d, matchIndexArr is:%v, rf.leaderCommit :%d",
-		rf.me, commitIndex, matchIndexArr, rf.leaderCommit)
-	lastLogTerm, _ := rf.getLastLogTermAndIndex()
-	if lastLogTerm == rf.currentTerm {
-		if commitIndex > rf.leaderCommit {
-			rf.leaderCommit = commitIndex
+	majorityCommitIndex := matchIndexArr[(len(rf.peers)-1)/2]
+	DPrintf("[%d] majorityCommitIndex is:%d, matchIndexArr is:%v, rf.leaderCommit :%d",
+		rf.me, majorityCommitIndex, matchIndexArr, rf.leaderCommit)
+	if majorityCommitIndex > rf.leaderCommit {
+		termOfCommitIndex := rf.logs[majorityCommitIndex].Term
+		if termOfCommitIndex == rf.currentTerm {
+			rf.leaderCommit = majorityCommitIndex
 			rf.applyLog()
 		}
 	}
@@ -738,7 +746,7 @@ func (rf *Raft) handleVoteReply(serverIndex int, requestTerm int, reply RequestV
 func (rf *Raft) election(electionSeq int, term int, n int64) {
 
 	var peerLen int
-	voteRequest := &RequestVoteArgs{
+	voteRequest := RequestVoteArgs{
 		CandidateId:rf.me}
 
 	preparedCheck := func() bool {
@@ -787,16 +795,16 @@ func (rf *Raft) election(electionSeq int, term int, n int64) {
 			continue
 		}
 
-		go func(peerIndex int) {
+		go func(peerIndex int, voteRequest RequestVoteArgs) {
 			var reply RequestVoteReply
 			DPrintf("[%d] start send request to [%d], term:%d, seq:%d",
 				rf.me, peerIndex, voteRequest.Term, electionSeq)
-			if rf.sendRequestVote(peerIndex, voteRequest, &reply) {
+			if rf.sendRequestVote(peerIndex, &voteRequest, &reply) {
 				DPrintf("[%d] recv reply from [%d], term:%d, seq:%d",
 					rf.me, peerIndex, voteRequest.Term, electionSeq)
 				rf.handleVoteReply(peerIndex, voteRequest.Term, reply)
 			}
-		}(peerIndex)
+		}(peerIndex, voteRequest)
 	}
 }
 
@@ -820,8 +828,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 
-	rf.lastLogIndex = -1
-	rf.lastLogTerm = -1
 	rf.leaderIndex = InvalidPeerNodeIndex
 	rf.currentTerm = 0
 	rf.votedFor = InvalidPeerNodeIndex
@@ -835,9 +841,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	{
 		rf.leaderCommit = 0
 		rf.lastApplied = 0
-		rf.lastLogIndex++
+		_, lastLogIndex := rf.getLastLogTermAndIndex()
+		lastLogIndex++
 		rf.logs = append(rf.logs, LogEntry{
-			Index:rf.lastLogIndex,
+			Index:lastLogIndex,
 			Term:0,
 			Command:0,
 		})
