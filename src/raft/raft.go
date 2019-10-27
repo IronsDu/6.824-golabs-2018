@@ -237,8 +237,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	// 检测此候选者的日志跟自己比较是否足够新
-	if args.LastLogIndex < lastLogIndex ||
-		(args.LastLogIndex == lastLogIndex && args.LastLogTerm < lastLogTerm) {
+	if args.LastLogTerm < lastLogTerm ||
+		(args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex) {
 		reply.VoteGranted = false
 		DPrintf("[%d] recv vote request, but log not update to date," +
 			" args:%v, rf:%v", rf.me, args, rf)
@@ -320,11 +320,11 @@ func (rf *Raft) RequestAppendLog(args *AppendLogRequest, reply *AppendLogReply) 
 		// 检查本地日志是否缺失(此次收到的日志)之前的日志
 		// 且验证之前日志的任期
 		if args.PrevLogIndex > lastLogIndex ||
-			args.PrevLogTerm < rf.logs[args.PrevLogIndex].Term {
+			args.PrevLogTerm != rf.logs[args.PrevLogIndex].Term {
 			DPrintf("[%d] error handle RequestAppendLog recv invalid log, PrevLogIndex:%d, lastLogIndex:%d," +
 				"PrevLogTerm:%d, self log:%v",
 				rf.me, args.PrevLogIndex, lastLogIndex, args.PrevLogTerm, rf.logs)
-			rf.switchFollower()
+			rf.currentTerm = args.Term
 			return
 		}
 	}
@@ -754,8 +754,8 @@ func (rf *Raft) election(electionSeq int, term int, n int64) {
 		defer rf.mu.Unlock()
 
 		now := time.Now().UnixNano()
-		DPrintf("[%d] start election, term:%d, self:%p, seq:%d, cost:%d ms, now:%d",
-			rf.me, rf.currentTerm, rf, electionSeq, (now-n)/1000/1000, now)
+		DPrintf("[%d] start election, term:%d, self:%p, seq:%d, cost:%d ms, now:%d, logs:%v",
+			rf.me, rf.currentTerm, rf, electionSeq, (now-n)/1000/1000, now, rf.logs)
 
 		if rf.raftState == PeerRaftStateLeader {
 			DPrintf("[%d] state is:%d when election check", rf.me, int(rf.raftState))
