@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"bytes"
+	"labgob"
 	"math/rand"
 	"sort"
 	"sync"
@@ -144,6 +146,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	rf.persister.SaveRaftState(w.Bytes())
 }
 
 
@@ -167,6 +176,28 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var currentTerm int
+	var votedFor int
+	var logs	[]LogEntry
+	if err := d.Decode(&currentTerm); err != nil {
+		DPrintf("[%d] readPersist currentTerm failed of:%s", rf.me, err.Error())
+		return
+	}
+	if err := d.Decode(&votedFor); err != nil {
+		DPrintf("[%d] readPersist votedFor failed of:%s", rf.me, err.Error())
+		return
+	}
+	if err := d.Decode(&logs); err != nil {
+		DPrintf("[%d] readPersist logs failed of:%s", rf.me, err.Error())
+		return
+	}
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.logs = logs
 }
 
 
@@ -194,13 +225,6 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-func (rf *Raft) UpdateTerm(term int) {
-	if term > rf.currentTerm {
-		rf.currentTerm = term
-		rf.switchFollower()
-		rf.votedFor = InvalidPeerNodeIndex
-	}
-}
 //
 // example RequestVote RPC handler.
 //
@@ -250,6 +274,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.me, rf.currentTerm, args.Term, rf)
 	rf.currentTerm = args.Term
 	rf.votedFor = args.CandidateId
+	rf.persist()
 	rf.switchFollower()
 }
 
@@ -324,7 +349,10 @@ func (rf *Raft) RequestAppendLog(args *AppendLogRequest, reply *AppendLogReply) 
 			DPrintf("[%d] error handle RequestAppendLog recv invalid log, PrevLogIndex:%d, lastLogIndex:%d," +
 				"PrevLogTerm:%d, self log:%v",
 				rf.me, args.PrevLogIndex, lastLogIndex, args.PrevLogTerm, rf.logs)
-			rf.currentTerm = args.Term
+			if rf.currentTerm < args.Term {
+				rf.currentTerm = args.Term
+				rf.persist()
+			}
 			return
 		}
 	}
@@ -360,7 +388,10 @@ func (rf *Raft) RequestAppendLog(args *AppendLogRequest, reply *AppendLogReply) 
 	}
 	rf.lastAppendLogTime = now
 	DPrintf("[%d] set term from %d to %d", rf.me, rf.currentTerm, args.Term)
-	rf.currentTerm = args.Term
+	if rf.currentTerm < args.Term || len(args.Entries) > 0 {
+		rf.currentTerm = args.Term
+		rf.persist()
+	}
 	rf.switchFollower()
 }
 
@@ -439,6 +470,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    term,
 		Command: command,
 	})
+	rf.persist()
 	DPrintf("[%d] start %v, current logs:%v", rf.me, command, rf.logs)
 	return index, term, isLeader
 }
@@ -464,7 +496,7 @@ func (rf *Raft) switchToLeader() {
 	rf.resetAppendLogRoutine()
 	// 立即进行一次日志复制
 	go func() {
-		rf.replicatedLog()
+		rf.replicatedLog(0)
 	}()
 }
 
@@ -484,6 +516,7 @@ func (rf* Raft) switchToCandidate() {
 	rf.voted = append(rf.voted, rf.me)
 	rf.raftState = PeerRaftStateCandidate
 	rf.leaderIndex = InvalidPeerNodeIndex
+	rf.persist()
 	DPrintf("[%d] switch to candidate, term:%d, self:%p", rf.me, rf.currentTerm, rf)
 }
 
@@ -539,7 +572,7 @@ func (rf *Raft) resetAppendLogRoutine() {
 	go rf.startAppendLogRoutine(rf.appendLogCh)
 }
 
-func (rf *Raft) replicatedLog() {
+func (rf *Raft) replicatedLog(lastTime int64) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -549,8 +582,8 @@ func (rf *Raft) replicatedLog() {
 	}
 
 	now := time.Now().UnixNano()
-	DPrintf("[%d] replicatedLog, self logs:%v, diff last time:%d ms",
-		rf.me, rf.logs, (now-rf.lastReplicateLogTime)/1000/1000)
+	DPrintf("[%d] replicatedLog, self logs:%v, diff last time:%d ms, now:%d, fuck cost:%d",
+		rf.me, rf.logs, (now-rf.lastReplicateLogTime)/1000/1000, now, now-lastTime)
 	rf.lastReplicateLogTime = now
 
 	rf.resetAppendLogRoutine()
@@ -593,8 +626,9 @@ func (rf *Raft) replicatedLog() {
 
 		go func(peerIndex int) {
 			var reply AppendLogReply
-			DPrintf("[%d] start append log to [%d], term:%d, seq:%d, log size:%d",
-				rf.me, peerIndex, appendLogRequest.Term, seq, len(appendLogRequest.Entries))
+			now := time.Now().UnixNano()
+			DPrintf("[%d] start append log to [%d], term:%d, seq:%d, log size:%d, now:%d",
+				rf.me, peerIndex, appendLogRequest.Term, seq, len(appendLogRequest.Entries), now)
 			if rf.sendAppendLog(peerIndex, appendLogRequest, &reply) {
 				rf.handleAppendLogReply(peerIndex, maxLogIndex, maxLogTerm, reply)
 				DPrintf("[%d] recv append log reply from [%d], msg term:%d, seq:%d",
@@ -608,7 +642,8 @@ func (rf *Raft) replicatedLog() {
 
 func (rf *Raft) startAppendLogRoutine(appendLogCh <- chan interface{}) {
 	ticker := time.NewTimer(time.Millisecond * time.Duration(LeaderAppendLogTimeoutMilliSeconds))
-
+	now := time.Now().UnixNano()
+	DPrintf("[%d] startAppendLogRoutine, now:%d", rf.me, now)
 	select {
 	case <- appendLogCh:
 		DPrintf("[%d] recv notify stop append log", rf.me)
@@ -617,7 +652,7 @@ func (rf *Raft) startAppendLogRoutine(appendLogCh <- chan interface{}) {
 		DPrintf("[%d] recv kill", rf.me)
 		break
 	case <- ticker.C:
-		rf.replicatedLog()
+		rf.replicatedLog(now)
 		break
 	}
 }
@@ -668,6 +703,7 @@ func (rf *Raft) handleAppendLogReply(peerIndex int, maxLogIndex int, maxLogTerm 
 		DPrintf("[%d] append log to [%d] failed", rf.me, peerIndex)
 		if reply.Term > rf.currentTerm {
 			rf.currentTerm = reply.Term
+			rf.persist()
 			rf.switchFollower()
 		} else {
 			state := rf.getFollowerState(peerIndex)
@@ -736,6 +772,7 @@ func (rf *Raft) handleVoteReply(serverIndex int, requestTerm int, reply RequestV
 		DPrintf("[%d] recv vote reject from [%d]", rf.me, serverIndex)
 		DPrintf("[%d] set term %d to %d, self:%p", rf.me, rf.currentTerm, reply.Term, rf)
 		rf.currentTerm = reply.Term
+		rf.persist()
 		rf.switchFollower()
 	} else {
 		DPrintf("[%d] recv other vote reply from [%d], reply term:%d, self term:%d, granted:%t",
