@@ -1,6 +1,8 @@
 package raftkv
 
 import (
+	"encoding/gob"
+	"errors"
 	"labgob"
 	"labrpc"
 	"log"
@@ -33,17 +35,117 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	kv	map[string]string
+	kvGuard sync.RWMutex
+	waitChMap map[int]chan interface{}
+	waitChGuard sync.RWMutex
 }
 
+type KVCommandType int
+const (
+	KvGet	KVCommandType = iota
+	KvPutAppend
+)
+
+type KVLogStructure struct {
+	Command	KVCommandType
+	Args interface{}
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	log := &KVLogStructure{
+		Command:KvGet,
+		Args:args,
+	}
+
+	if err := kv.waitStartLog(log); err != nil {
+		reply.WrongLeader = true
+		reply.Err = Err(err.Error())
+		return
+	}
+
+	kv.kvGuard.Lock()
+	defer kv.kvGuard.Unlock()
+
+	if v, ok := kv.kv[args.Key]; ok {
+		reply.Value = v
+	}
+}
+
+func (kv *KVServer) waitStartLog(log *KVLogStructure) error {
+	index, term, ok := kv.rf.Start(log)
+	if !ok {
+		return errors.New("不是leader")
+	}
+
+	ch := make(chan interface{})
+	defer func() {
+		kv.waitChGuard.Lock()
+		defer kv.waitChGuard.Unlock()
+		delete(kv.waitChMap, index)
+	}()
+	func() {
+		kv.waitChGuard.Lock()
+		defer kv.waitChGuard.Unlock()
+		kv.waitChMap[index] = ch
+	}()
+
+	<- ch
+
+	if logEntry, err := kv.rf.GetLogEntry(index); err != nil {
+		return err
+	} else if term != logEntry.Term {
+		return errors.New("任期过期")
+	}
+
+	return nil
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	log := &KVLogStructure{
+		Command:KvPutAppend,
+		Args:args,
+	}
+
+	if err := kv.waitStartLog(log); err != nil {
+		reply.WrongLeader = true
+		reply.Err = Err(err.Error())
+		return
+	}
+
+	kv.kvGuard.Lock()
+	defer kv.kvGuard.Unlock()
+
+	switch args.Op {
+	case "Put":
+		kv.kv[args.Key] = args.Value
+		break
+	case "Append":
+		if v, ok := kv.kv[args.Key]; ok {
+			v += args.Value
+			kv.kv[args.Key] = v
+		} else {
+			kv.kv[args.Key] = args.Value
+		}
+		break;
+	}
 }
 
+func (kv *KVServer) watchLogApply() {
+	for msg := range kv.applyCh {
+		func() {
+			kv.waitChGuard.Lock()
+			defer kv.waitChGuard.Unlock()
+
+			ch := kv.waitChMap[msg.CommandIndex]
+			if ch != nil {
+				ch <- true
+			}
+		}()
+	}
+}
 //
 // the tester calls Kill() when a KVServer instance won't
 // be needed again. you are not required to do anything
@@ -82,8 +184,18 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.kv = make(map[string]string)
+	kv.waitChMap = make(map[int]chan interface{})
 
 	// You may need initialization code here.
 
+	go kv.watchLogApply()
+
 	return kv
+}
+
+func init() {
+	gob.Register(KVLogStructure{})
+	gob.Register(PutAppendArgs{})
+	gob.Register(GetArgs{})
 }

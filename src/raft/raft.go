@@ -19,6 +19,7 @@ package raft
 
 import (
 	"bytes"
+	"errors"
 	"labgob"
 	"math/rand"
 	"sort"
@@ -469,6 +470,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	_, _ = DPrintf("[%d] start command:%v, term:%d, index:%d, logs:%v",
 		rf.me, command, rf.currentTerm, index, rf.logs)
 	return index, term, isLeader
+}
+
+func (rf *Raft) GetLogEntry(index int) (LogEntry, error) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if index > len(rf.logs) {
+		return LogEntry{}, errors.New("index 太大")
+	}
+
+	return rf.logs[index], nil
 }
 
 func (rf *Raft) appendCommand(command interface{}) (int, int) {
