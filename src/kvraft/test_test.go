@@ -559,7 +559,7 @@ func TestManyPartitionsManyClients3A(t *testing.T) {
 }
 
 func TestPersistOneClient3A(t *testing.T) {
-	// Test: restarts, one client (3A) ...
+	// Test: restarts, one client (3A) ...|N
 	GenericTest(t, "3A", 1, false, true, false, -1)
 }
 

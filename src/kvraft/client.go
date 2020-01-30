@@ -1,14 +1,31 @@
 package raftkv
 
-import "labrpc"
+import (
+	"labrpc"
+	"sync"
+)
 import "crypto/rand"
 import "math/big"
 
+var CurrentId = 0
+var IdGuard sync.Mutex
+
+func takeClerkId() int {
+	var id = 0
+	IdGuard.Lock()
+	CurrentId++
+	id = CurrentId
+	IdGuard.Unlock()
+	return id
+}
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	leader *labrpc.ClientEnd
+	seq int
+	seqGuard sync.Mutex
+	id int
 }
 
 func nrand() int64 {
@@ -22,7 +39,16 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.seq = 0
+	ck.id = takeClerkId()
 	return ck
+}
+
+func (ck *Clerk) takeSeq() int {
+	ck.seqGuard.Lock()
+	defer ck.seqGuard.Unlock()
+	ck.seq++
+	return ck.seq
 }
 
 //
@@ -42,6 +68,8 @@ func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	args := &GetArgs{
 		Key:key,
+		Seq:ck.takeSeq(),
+		Ident:ck.id,
 	}
 
 	if ck.leader != nil {
@@ -79,6 +107,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Key:key,
 		Value:value,
 		Op:op,
+		Seq:ck.takeSeq(),
+		Ident:ck.id,
 	}
 
 	if ck.leader != nil {

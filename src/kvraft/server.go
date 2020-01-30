@@ -19,6 +19,13 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+func DFatal(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Fatalf(format, a...)
+	}
+	return
+}
+
 
 type Op struct {
 	// Your definitions here.
@@ -39,6 +46,9 @@ type KVServer struct {
 	kvGuard sync.RWMutex
 	waitChMap map[int]chan interface{}
 	waitChGuard sync.RWMutex
+
+	clientSeqMap map[int]int
+	clientSeqMapGuard sync.Mutex
 }
 
 type KVCommandType int
@@ -54,15 +64,18 @@ type KVLogStructure struct {
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	log := &KVLogStructure{
+	log := KVLogStructure{
 		Command:KvGet,
-		Args:args,
+		Args:*args,
 	}
 
-	if err := kv.waitStartLog(log); err != nil {
+	var logIndex int
+	if index, err := kv.waitStartLog(log); err != nil {
 		reply.WrongLeader = true
 		reply.Err = Err(err.Error())
 		return
+	} else {
+		logIndex = index
 	}
 
 	kv.kvGuard.Lock()
@@ -70,13 +83,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	if v, ok := kv.kv[args.Key]; ok {
 		reply.Value = v
+		_, _ = DPrintf("KVServer Raft[%d] log index:%d, Get key:%s, value:%s\n",
+			kv.rf.GetMe(), logIndex, args.Key, v)
 	}
 }
 
-func (kv *KVServer) waitStartLog(log *KVLogStructure) error {
+func (kv *KVServer) waitStartLog(log KVLogStructure) (int, error) {
 	index, term, ok := kv.rf.Start(log)
 	if !ok {
-		return errors.New("不是leader")
+		return index, errors.New("not be leader")
 	}
 
 	ch := make(chan interface{})
@@ -85,56 +100,97 @@ func (kv *KVServer) waitStartLog(log *KVLogStructure) error {
 		defer kv.waitChGuard.Unlock()
 		delete(kv.waitChMap, index)
 	}()
-	func() {
-		kv.waitChGuard.Lock()
-		defer kv.waitChGuard.Unlock()
-		kv.waitChMap[index] = ch
-	}()
+	kv.waitChGuard.Lock()
+	kv.waitChMap[index] = ch
+	kv.waitChGuard.Unlock()
 
 	<- ch
 
 	if logEntry, err := kv.rf.GetLogEntry(index); err != nil {
-		return err
+		return index, err
 	} else if term != logEntry.Term {
-		return errors.New("任期过期")
+		return index, errors.New("任期过期")
 	}
 
-	return nil
+	return index, nil
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	log := &KVLogStructure{
+	log := KVLogStructure{
 		Command:KvPutAppend,
-		Args:args,
+		Args:*args,
 	}
 
-	if err := kv.waitStartLog(log); err != nil {
+	if logIndex, err := kv.waitStartLog(log); err != nil {
 		reply.WrongLeader = true
 		reply.Err = Err(err.Error())
 		return
+	} else {
+		_, _ = DPrintf("KVServer Raft[%d] log index:%d, PutAppend args:%v \n", kv.rf.GetMe(), logIndex, args)
 	}
+}
 
-	kv.kvGuard.Lock()
-	defer kv.kvGuard.Unlock()
-
+func (kv *KVServer) applyPutAppendCommand(args PutAppendArgs) string {
 	switch args.Op {
 	case "Put":
 		kv.kv[args.Key] = args.Value
-		break
+		return args.Value
 	case "Append":
+		kv.clientSeqMapGuard.Lock()
+		defer kv.clientSeqMapGuard.Unlock()
+		if seq, ok := kv.clientSeqMap[args.Ident]; !ok {
+			kv.clientSeqMap[args.Ident] = args.Seq
+		} else if args.Seq <= seq {
+			_, _ = DPrintf("don't process this request \n")
+			return ""
+		} else {
+			kv.clientSeqMap[args.Ident] = args.Seq
+		}
 		if v, ok := kv.kv[args.Key]; ok {
 			v += args.Value
 			kv.kv[args.Key] = v
+			return v
 		} else {
 			kv.kv[args.Key] = args.Value
+			return args.Value
 		}
-		break;
+	default:
+		_, _ = DFatal("invalid op:%s \n", args.Op)
+	}
+
+	return ""
+}
+
+func (kv *KVServer) applyUserLog(commandIndex int, userLog KVLogStructure) {
+	switch userLog.Command {
+	case KvGet:
+		break
+	case KvPutAppend:
+		args := userLog.Args.(PutAppendArgs)
+		lastValue := kv.applyPutAppendCommand(args)
+		_, _ = DPrintf("raft:%d apply, Put[%s] by [%s], current value:%s , log index[%d]\n",
+			kv.rf.GetMe(), args.Key, args.Value, lastValue, commandIndex)
+		break
+	default:
+		_, _ = DFatal("invalid command of:%d \n", userLog.Command)
 	}
 }
 
 func (kv *KVServer) watchLogApply() {
 	for msg := range kv.applyCh {
+		if _, ok := msg.Command.(int); ok {
+			continue
+		}
+		userLog, ok := msg.Command.(KVLogStructure)
+		if !ok {
+			_,_ = DFatal("not be kv log structure")
+			continue
+		}
+
+		kv.applyUserLog(msg.CommandIndex, userLog)
+
+		// notice
 		func() {
 			kv.waitChGuard.Lock()
 			defer kv.waitChGuard.Unlock()
@@ -186,6 +242,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.kv = make(map[string]string)
 	kv.waitChMap = make(map[int]chan interface{})
+	kv.clientSeqMap = make(map[int]int)
 
 	// You may need initialization code here.
 
