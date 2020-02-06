@@ -132,6 +132,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 }
 
 func (kv *KVServer) applyPutAppendCommand(args PutAppendArgs) string {
+	kv.kvGuard.Lock()
+	defer kv.kvGuard.Unlock()
+
 	switch args.Op {
 	case "Put":
 		kv.kv[args.Key] = args.Value
